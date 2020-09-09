@@ -1,90 +1,87 @@
-import path from 'path';
 import fs from 'fs';
-import csv from 'csv-parse';
+import csvParse from 'csv-parse';
 import { getCustomRepository, getRepository, In } from 'typeorm';
 import Transaction from '../models/Transaction';
 
-import uploadConfig from '../config/upload';
 import TransactionsRepository from '../repositories/TransactionsRepository';
 import Category from '../models/Category';
 
-interface Request {
-  filename: string;
-}
-
-interface TransactionDTO {
+interface TransactionCSV {
   title: string;
   type: 'income' | 'outcome';
   value: number;
   category: string;
 }
 
-class ImportTransactionsService {
-  async execute({ filename }: Request): Promise<Transaction[]> {
+export default class ImportTransactionsService {
+  async execute(filePath: string): Promise<Transaction[]> {
     const categoriesRepository = getRepository(Category);
     const transactionsRepository = getCustomRepository(TransactionsRepository);
 
-    const transactionsToSave: TransactionDTO[] = [];
-    const categoriesCSV: string[] = [];
+    const contactReadStream = fs.createReadStream(filePath);
 
-    const parser = csv({ delimiter: ', ', from_line: 2, ltrim: true });
-    const parseCSV = fs
-      .createReadStream(path.join(uploadConfig.directory, filename))
-      .pipe(parser);
+    const parsers = csvParse({
+      delimiter: ',',
+      from_line: 2,
+    });
 
-    parseCSV.on('data', async row => {
-      const [title, type, value, category] = row;
-      categoriesCSV.push(category);
-      const transactionToSave: TransactionDTO = {
-        title,
-        type,
-        value: Number(value),
-        category,
-      };
-      transactionsToSave.push(transactionToSave);
+    const parseCSV = contactReadStream.pipe(parsers);
+
+    const transactions: TransactionCSV[] = [];
+    const categories: string[] = [];
+
+    parseCSV.on('data', async line => {
+      const [title, type, value, category] = line.map((cell: string) =>
+        cell.trim(),
+      );
+
+      if (!title || !type || !value) return;
+
+      categories.push(category);
+      transactions.push({ title, type, value, category });
     });
 
     await new Promise(resolve => parseCSV.on('end', resolve));
 
-    const existentCategories = await categoriesRepository.find({
+    const existanceCategories = await categoriesRepository.find({
       where: {
-        title: In(categoriesCSV),
+        title: In(categories),
       },
     });
 
-    const existentCategoriesTitles = existentCategories.map(
-      category => category.title,
+    const existentCategoryTitle = existanceCategories.map(
+      (category: Category) => category.title,
     );
 
-    const addCategoriesTitle = categoriesCSV
-      .filter(category => !existentCategoriesTitles.includes(category))
+    const addCategory = categories
+      .filter(category => !existentCategoryTitle.includes(category))
       .filter((value, index, self) => self.indexOf(value) === index);
 
     const newCategories = categoriesRepository.create(
-      addCategoriesTitle.map(title => ({ title })),
+      addCategory.map(title => ({
+        title,
+      })),
     );
 
     await categoriesRepository.save(newCategories);
 
-    const finalCategories = [...newCategories, ...existentCategories];
+    const finalCategories = [...newCategories, ...existanceCategories];
 
-    const createdTransactions = transactionsRepository.create(
-      transactionsToSave.map(transaction => ({
+    const createTransactions = transactionsRepository.create(
+      transactions.map(transaction => ({
         title: transaction.title,
         type: transaction.type,
         value: transaction.value,
-        category_id: finalCategories.find(
+        category: finalCategories.find(
           category => category.title === transaction.category,
-        )?.id,
+        ),
       })),
     );
 
-    await transactionsRepository.save(createdTransactions);
+    await transactionsRepository.save(createTransactions);
 
-    await fs.promises.unlink(path.join(uploadConfig.directory, filename));
+    await fs.promises.unlink(filePath);
 
-    return createdTransactions;
+    return createTransactions;
   }
 }
-
-export default ImportTransactionsService;
